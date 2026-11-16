@@ -1,0 +1,59 @@
+{
+  "name": "dsh-context-guard",
+  "version": "0.1.0",
+  "description": "Context guard for DeepSeek Harness: live payload size on the answer action row, warn/danger colors, one-click handoff (draft only).",
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "context",
+    "compact",
+    "handoff",
+    "token",
+    "usage"
+  ],
+  "license": "MIT",
+  "author": {
+    "name": "Changye Pan"
+  },
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "icon.png",
+    "docs/*.png",
+    "screenshots.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pcysanji/dsh-context-guard.git"
+  },
+  "homepage": "https://github.com/pcysanji/dsh-context-guard#readme",
+  "bugs": {
+    "url": "https://github.com/pcysanji/dsh-context-guard/issues"
+  }
+}
