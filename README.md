@@ -61,8 +61,8 @@
 # 从市场条目所在的仓库安装
 dsh plugin add pcysanji/dsh-context-guard
 
-# 或者从 npm（发布后）
-dsh plugin add dsh-context-guard
+# 或者从 npm
+dsh plugin add @pcysanji/dsh-context-guard
 ```
 
 也可以在 DSH 的插件市场里搜 `上下文看门` / `dsh-context-guard` 一键安装。

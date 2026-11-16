@@ -1,5 +1,5 @@
 {
-  "name": "dsh-context-guard",
+  "name": "@pcysanji/dsh-context-guard",
   "version": "0.1.0",
   "description": "Context guard for DeepSeek Harness: live payload size on the answer action row, warn/danger colors, one-click handoff (draft only).",
   "keywords": [
@@ -55,5 +55,8 @@
   "homepage": "https://github.com/pcysanji/dsh-context-guard#readme",
   "bugs": {
     "url": "https://github.com/pcysanji/dsh-context-guard/issues"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }
