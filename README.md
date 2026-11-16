@@ -1,4 +1,4 @@
-# 上下文看门（dsh-context-guard）
+# 上下文看门（dsh-context-ruler）
 
 在每条回答的动作行里显示当前会话的上下文体积，越过阈值时变色并提示交接；点一下「交接」，写好交接文档、新建会话，并把「先读交接文档」的指令停在输入框里等你确认。
 
@@ -59,13 +59,13 @@
 
 ```sh
 # 从市场条目所在的仓库安装
-dsh plugin add pcysanji/dsh-context-guard
+dsh plugin add pcysanji/dsh-context-ruler
 
 # 或者从 npm
-dsh plugin add @pcysanji/dsh-context-guard
+dsh plugin add dsh-context-ruler
 ```
 
-也可以在 DSH 的插件市场里搜 `上下文看门` / `dsh-context-guard` 一键安装。
+也可以在 DSH 的插件市场里搜 `上下文看门` / `dsh-context-ruler` 一键安装。
 
 ## 配置
 

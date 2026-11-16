@@ -1,5 +1,5 @@
-# dsh-context-guard：把插件本体的 Loader 条目登记出来（客户端半通过 package.json 的
+# dsh-context-ruler：把插件本体的 Loader 条目登记出来（客户端半通过 package.json 的
 # dsh.client 自动装载）。宿主半只挂一条本地 HTTP 路由，不注入任何消息。
 - insert:
     - id: context-guard
-      name: '@pcysanji/dsh-context-guard'
+      name: 'dsh-context-ruler'
