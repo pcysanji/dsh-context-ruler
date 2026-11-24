@@ -525,6 +525,51 @@ function toolUsage(messages) {
   return { named, namedSkills }
 }
 
+/* 最近的工具调用（名称 + 关键参数），用来保住命令、PR 号、接口这些硬事实。 */
+function recentToolCalls(messages, limit) {
+  const out = []
+  for (const message of messages) {
+    for (const block of messageBlocks(message)) {
+      if (!block || block.type !== 'tool-call') continue
+      const args = toolCallArgs(block)
+      let hint = ''
+      if (args) {
+        if (typeof args.command === 'string') hint = args.command
+        else if (typeof args.pattern === 'string') hint = args.pattern
+        else if (typeof args.path === 'string') hint = args.path
+        else if (typeof args.file_path === 'string') hint = args.file_path
+        else if (typeof args.url === 'string') hint = args.url
+        else if (typeof args.script_path === 'string') hint = args.script_path
+      }
+      out.push('- ' + String(block.name || '?') + (hint ? '：' + clip(hint.replace(/\\s+/g, ' '), 160) : ''))
+    }
+  }
+  return limit && out.length > limit ? out.slice(out.length - limit) : out
+}
+
+/* 材料里出现过的链接与 PR/issue 号：交接时最容易被模型遗忘、也最伤事实的一类。 */
+function linksSeen(messages, limit) {
+  const seen = new Map()
+  const url = /https?:\/\/[^\s"'`<>)\]]+/g
+  const ref = /(?:^|[\s(（\[])PR\s*#(\d+)|\/pull\/(\d+)/gi
+  for (const message of messages) {
+    const text = messageText(message)
+    if (!text) continue
+    for (const hit of String(text).match(url) || []) {
+      const clean = hit.replace(/[.,;:]+$/, '')
+      if (!seen.has(clean)) seen.set(clean, true)
+    }
+    let m
+    while ((m = ref.exec(String(text))) !== null) {
+      const n = m[1] || m[2]
+      const key = 'PR #' + n
+      if (!seen.has(key)) seen.set(key, true)
+    }
+  }
+  const all = Array.from(seen.keys())
+  return limit && all.length > limit ? all.slice(all.length - limit) : all
+}
+
 /* 交给模型的事实包：先保证「人说过什么」，再补助手结论、工具与路径，超预算就截尾。 */
 function buildFactPack(session, snapshot, cwd, messages, cfg) {
   const { named, namedSkills } = toolUsage(messages)
@@ -554,7 +599,11 @@ function buildFactPack(session, snapshot, cwd, messages, cfg) {
   if (namedSkills.length > 0) push('用过的 skill（来自工具调用）', namedSkills.map(([k, n]) => '- ' + k + ' × ' + n).join('\n'))
   if (named.length > 0) push('工具调用统计', named.map(([k, n]) => '- ' + k + ' × ' + n).join('\n'))
   push('用户说过的话（时间序，未改写）', users.map((t, i) => i + 1 + '. ' + clip(t, 800)).join('\n'))
-  push('助手说过的话（尾部结论，未改写）', notes.map((t, i) => '- ' + clip(t, 500)).join('\n'))
+  push('助手说过的话（尾部结论，未改写）', notes.map((t, i) => '- ' + clip(t, 800)).join('\n'))
+  const calls = recentToolCalls(messages, 60)
+  if (calls.length > 0) push('最近的工具调用（名称：关键参数）', calls.join('\n'))
+  const links = linksSeen(messages, 40)
+  if (links.length > 0) push('材料里出现过的链接与 PR 号', links.map((x) => '- ' + x).join('\n'))
   if (paths.length > 0) push('出现过的绝对路径（最近 ' + paths.length + ' 条）', paths.map((p) => '- ' + p).join('\n'))
   return chunks.join('')
 }
@@ -574,6 +623,12 @@ const HANDOFF_SYSTEM = [
   '已完成逐条带产物路径或可复现命令；未完成逐条写清卡在哪；下一步只写接手者的第一个具体动作；',
   'skill 只列真的被调用过的，并说明关键取舍为什么这么定；约束与坑分开写「用户要求」「已踩的坑」「不能碰」。',
   '同一件事只写结论和证据，不复述来回调试的过程。全文控制在 1200 字以内。',
+  '硬要求：',
+  '- 目标取最早那条实质需求（用户第一次要求做的事），不要把中间的抱怨、追问、或者最近一条「检查一下文档」当成目标。',
+  '- 下一步必须是接手者能直接开工的业务动作（读哪个文件、跑哪条命令、改哪个函数）。绝对不要写「重新生成交接文档」「复核本文件」「确认交接是否完整」这类关于文档自身的元任务；如果材料最后几轮只是在讨论这份文档本身，直接忽略，回到真正的业务剩余工作。',
+  '- 只能使用材料中出现的数字、版本号、PR 号、路径与命令输出；材料没有就写「未记录」，不要用常识补齐，也不要把「已关闭的 PR」说成「尚未提交」。',
+  '- 已完成与未完成都写现在仍然成立的状态，不要写已经被后续步骤推翻的旧结论。',
+  '- 「已完成」只写材料能证明做过、且留下产物（文件、命令输出、接口响应）的事。用户提出的要求、计划、或者中途说过「我来改」都不算完成；如果材料显示某个做法失败后换了方案（例如要更新某个 skill 但因故改为新建另一个 skill），写实际发生的那一件，不要写成原计划。',
 ].join('\n')
 
 async function modelSummary(ctx, session, pack, cfg) {
@@ -616,7 +671,11 @@ async function modelSummary(ctx, session, pack, cfg) {
     for await (const chunk of stream) {
       if (!chunk) continue
       if (chunk.type === 'text-delta' && chunk.text) text += chunk.text
-      if (chunk.type === 'finish' && chunk.reason && chunk.reason.kind) finish = chunk.reason.kind
+      if (chunk.type === 'finish' && chunk.reason) {
+        finish = chunk.reason.kind || ''
+        const failure = chunk.reason.failure
+        if (failure) error = (failure.code ? failure.code + ': ' : '') + (failure.message || '调用失败')
+      }
     }
   } catch (failure) {
     error = failure && failure.message ? failure.message : String(failure)
