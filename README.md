@@ -38,20 +38,24 @@
 
 点「交接」之后：
 
-1. 宿主把交接文档写到 `<工作目录>/_交付/交接_YYYY-MM-DD_HHmm.md`，内容含目标、最近对话摘录、从工具调用里提取的关键路径，以及已完成 / 未完成 / 下一步的骨架。
+1. 宿主把会话整理成一份交接文档，写到 `<工作目录>/_交付/<项目名>_<YYYYMMDD>交接.md`。同一项目同一天只有一份，重跑覆盖。
 2. 新建一个同工作目录的会话。
-3. 把这段指令预填进输入框，**不自动发送**：
+3. 把这段指令预填进输入框，**不自动发送**（首行就是文档名，新会话标题读起来就是一次交接）：
 
 ```
-接着上一个会话继续。先读交接文档：<绝对路径>
+「AI影视工作流_20261124交接」接着上一个会话继续。先读交接文档：<绝对路径>
 读完后用一句话复述「要做什么、从哪继续」，等我确认再动手。
 ```
+
+文档不是「最近对话的摘录」，是**模型整理过的交接**：目标、当前状态（带证据）、已完成、未完成、下一步、用到的 skill 与关键决定、约束与坑。整理用当前会话自己的模型路由，一次点击一次调用，通常 20–60 秒，按钮会变成「正在写交接文档…」。`handoffAi: false` 可退回本机摘录版（零调用、立即可得，但只有事实清单）。
+
+整理时只把「用户说过的话、助手结论、工具调用统计、出现过的路径」打包（默认上限 120 KB，`handoffMaxInputBytes`），不把 6 MB 原文整个喂给模型。输出被截断时文档里会写明「在模型输出上限处被截断」。
 
 ## 零 token，不阻断
 
 插件只做本地计算：宿主读 `session.deriveMessages()`，客户端通过本地 HTTP（`/context-guard/api/*`）取数字。
 
-- 不注入消息、不调模型、不读上游；
+- 体积数字不注入消息、不调模型、不读上游；
 - 不拦截发送、不自动压缩、不自动切会话；
 - 关掉插件后，DSH 的行为和装之前完全一样。
 
@@ -83,6 +87,9 @@ dsh plugin add dsh-context-ruler
 | `dangerRatio` | `0.85` | 变红阈值 |
 | `refreshEveryTurns` | `25` | 后台重算的最少回合间隔；悬停/点击总是立即重算 |
 | `handoffDir` | `_交付` | 交接文档目录（相对工作目录） |
+| `handoffAi` | `true` | 交接文档由模型整理；关掉则退回本机摘录 |
+| `handoffTimeoutMs` | `180000` | 单次整理的超时，超时后退回本机摘录 |
+| `handoffMaxInputBytes` | `120000` | 交给模型的材料上限 |
 | `imageBytes` | `350000` | 图片估不出字节时的兜底值 |
 
 ## 边界
@@ -93,7 +100,7 @@ dsh plugin add dsh-context-ruler
 
 ## English
 
-Context guard for DeepSeek Harness. Shows the live payload size of the current conversation on the assistant action row (`3.2 / 5.6 MB`), turns yellow/red as you approach the send limit, and offers a one-click handoff: it writes a handoff document, opens a new session in the same workspace, and leaves the "read the handoff doc first" prompt in the composer without sending it.
+Context guard for DeepSeek Harness. Shows the live payload size of the current conversation on the assistant action row (`3.2 / 5.6 MB`), turns yellow/red as you approach the send limit, and offers a one-click handoff: it has the session's own model write a real handoff document, opens a new session in the same workspace, and leaves the "read the handoff doc first" prompt in the composer without sending it.
 
 Everything is computed locally — no messages injected, no model calls, no intercepted sends. The context window is taken from the running model by default, and the size/limit figures stay visible on every answer.
 

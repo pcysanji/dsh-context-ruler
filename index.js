@@ -35,6 +35,9 @@ const DEFAULTS = {
   autoHandoff: false,
   imageBytes: 350000,
   handoffDir: '_交付',
+  handoffAi: true,
+  handoffTimeoutMs: 180000,
+  handoffMaxInputBytes: 120000,
 }
 
 /* ------------------------------------------------------------------ *
@@ -84,6 +87,9 @@ function loadConfig() {
   value.dangerRatio = num(value.dangerRatio, DEFAULTS.dangerRatio)
   value.imageBytes = num(value.imageBytes, DEFAULTS.imageBytes)
   value.autoLimit = value.autoLimit !== false
+  value.handoffAi = value.handoffAi !== false
+  value.handoffTimeoutMs = num(value.handoffTimeoutMs, DEFAULTS.handoffTimeoutMs)
+  value.handoffMaxInputBytes = num(value.handoffMaxInputBytes, DEFAULTS.handoffMaxInputBytes)
   value.enabled = value.enabled !== false
   value.showBadge = value.showBadge !== false
   value.showAlerts = value.showAlerts !== false
@@ -166,6 +172,11 @@ const INJECTION_PREFIXES = [
   'This is an efficiency nudge',
   'Context breakdown:',
   'Available skills',
+  'background job ',
+  'You are repeating the exact same tool call',
+  'Elapsed since the',
+  'Read the file before',
+  'The available skill catalog changed',
 ]
 
 function isInjectedText(text) {
@@ -423,82 +434,321 @@ function collectPaths(messages, max) {
       }
     }
   }
-  const all = Array.from(seen.values())
+  /* 正文里夹带的残片、测试夹具、以及「只是别人的父目录」都不该进交接文档。 */
+  const usable = Array.from(seen.values()).filter((value) => {
+    if (/[」】\n\r]/.test(value)) return false
+    if (/(^|[\\/])__/.test(value)) return false
+    return true
+  })
+  const specific = usable.filter(
+    (value) => !usable.some((other) => other !== value && pathKey(other).startsWith(pathKey(value) + '\\')),
+  )
+  const all = specific.length > 0 ? specific : usable
   return all.slice(Math.max(0, all.length - max))
 }
 
-function buildHandoffDoc(ctx, session, snapshot, cfg) {
-  const messages = session.deriveMessages()
-  const header = session.header || {}
-  const title = header.title || session.id
-  const cwd = resolveCwd(ctx, session)
-  const now = new Date()
+/* 交接文档的命名与内容都以「项目名」为主线：新会话标题读起来就是一次交接，而不是一段陌生路径。 */
+function projectName(cwd) {
+  const base = path.basename(path.resolve(cwd || '.'))
+  if (!base || base === '.' || base === path.sep) return 'workspace'
+  return base.replace(/[\\/:*?"<>|]/g, '_').slice(0, 60)
+}
 
-  const userMessages = messages.filter((m) => m && m.role === 'user' && !isInjectedMessage(m))
-  const goalSource = userMessages.length > 0 ? userMessages[userMessages.length - 1] : null
+function handoffBaseName(cwd, now) {
+  const day = String(now.getFullYear()) + pad2(now.getMonth() + 1) + pad2(now.getDate())
+  return projectName(cwd) + '_' + day + '交接'
+}
 
-  const recent = []
-  for (let i = messages.length - 1; i >= 0 && recent.length < 24; i -= 1) {
-    const message = messages[i]
-    if (!message) continue
-    if (message.role !== 'user' && message.role !== 'assistant') continue
-    if (isInjectedMessage(message)) continue
-    const text = clip(messageText(message), 220)
-    if (!text) continue
-    recent.push({ role: message.role, text, time: message.time })
+/* 同一项目同一天只有一份交接文档：重跑就覆盖，避免下一个人面对一堆同名的旧稿。 */
+function handoffFilePath(dir, base) {
+  return path.join(dir, base + '.md')
+}
+
+function toolCallArgs(block) {
+  if (!block) return null
+  if (block.arguments && typeof block.arguments === 'object') return block.arguments
+  if (typeof block.arguments !== 'string') return null
+  try {
+    return JSON.parse(block.arguments)
+  } catch {
+    return null
   }
-  recent.reverse()
+}
 
-  const paths = collectPaths(messages, 24)
-  const lines = []
-  lines.push('# 交接：' + title)
-  lines.push('')
-  lines.push('- 生成时间：' + now.getFullYear() + '-' + pad2(now.getMonth() + 1) + '-' + pad2(now.getDate()) + ' ' + pad2(now.getHours()) + ':' + pad2(now.getMinutes()))
-  lines.push('- 来源会话：`' + session.id + '`（' + snapshot.turns + ' 轮 / ' + snapshot.messages + ' 条消息）')
-  lines.push('- 工作目录：`' + cwd + '`')
-  lines.push('- 上下文体积：' + (snapshot.bytes / 1e6).toFixed(1) + ' / ' + (snapshot.limit / 1e6).toFixed(1) + ' MB（' + snapshot.percent + '%）')
+/* 用户真实说过的话（时间序、去重、不截断关键信息）。 */
+function userInstructions(messages, limit) {
+  const out = []
+  let lastKey = ''
+  for (const message of messages) {
+    if (!message || message.role !== 'user') continue
+    if (isInjectedMessage(message)) continue
+    const text = String(messageText(message) || '').trim()
+    if (!text) continue
+    const flat = text.replace(/\s+/g, ' ')
+    if (flat === lastKey) continue
+    lastKey = flat
+    out.push(flat)
+  }
+  return limit && out.length > limit ? out.slice(out.length - limit) : out
+}
+
+/* 助手说过的话，只留结尾那几段结论，过程里的寒暄没有交接价值。 */
+function assistantNotes(messages, limit) {
+  const out = []
+  for (const message of messages) {
+    if (!message || message.role !== 'assistant') continue
+    const text = String(messageText(message) || '').trim()
+    if (!text) continue
+    out.push(text.replace(/\s+/g, ' '))
+  }
+  return limit && out.length > limit ? out.slice(out.length - limit) : out
+}
+
+function toolUsage(messages) {
+  const counts = new Map()
+  const skills = new Map()
+  for (const message of messages) {
+    for (const block of messageBlocks(message)) {
+      if (!block || block.type !== 'tool-call') continue
+      const name = String(block.name || '').trim()
+      if (!name) continue
+      counts.set(name, (counts.get(name) || 0) + 1)
+      if (name === 'skill' || name.endsWith('skill')) {
+        const args = toolCallArgs(block)
+        const label = args && (args.name || args.skill || args.command)
+        if (label) skills.set(String(label), (skills.get(String(label)) || 0) + 1)
+      }
+    }
+  }
+  const named = Array.from(counts.entries()).sort((a, b) => b[1] - a[1]).slice(0, 20)
+  const namedSkills = Array.from(skills.entries()).sort((a, b) => b[1] - a[1]).slice(0, 20)
+  return { named, namedSkills }
+}
+
+/* 交给模型的事实包：先保证「人说过什么」，再补助手结论、工具与路径，超预算就截尾。 */
+function buildFactPack(session, snapshot, cwd, messages, cfg) {
+  const { named, namedSkills } = toolUsage(messages)
+  const users = userInstructions(messages)
+  const notes = assistantNotes(messages, 80)
+  const paths = collectPaths(messages, 30)
   const parts = snapshot.parts || {}
-  lines.push(
-    '- 体积构成：工具结果 ' + ((parts.tool || 0) / 1e6).toFixed(1) +
-    ' MB / 助手文本 ' + ((parts.assistant || 0) / 1e6).toFixed(1) +
-    ' MB / 用户消息 ' + ((parts.user || 0) / 1e6).toFixed(1) +
-    ' MB / 注入提醒 ' + ((parts.injected || 0) / 1e6).toFixed(1) + ' MB',
+  const budget = cfg.handoffMaxInputBytes || DEFAULTS.handoffMaxInputBytes
+  const chunks = []
+  let used = 0
+  const push = (title, body) => {
+    const block = '\n### ' + title + '\n' + body + '\n'
+    if (used + block.length > budget) return false
+    chunks.push(block)
+    used += block.length
+    return true
+  }
+  push(
+    '会话',
+    [
+      '- 工作目录：' + cwd,
+      '- 轮次 / 消息：' + snapshot.turns + ' 轮 / ' + snapshot.messages + ' 条',
+      '- 上下文体积：' + (snapshot.bytes / 1e6).toFixed(1) + ' / ' + (snapshot.limit / 1e6).toFixed(1) + ' MB（' + snapshot.percent + '%）',
+      '- 体积构成：工具结果 ' + ((parts.tool || 0) / 1e6).toFixed(1) + ' MB / 助手文本 ' + ((parts.assistant || 0) / 1e6).toFixed(1) + ' MB / 用户消息 ' + ((parts.user || 0) / 1e6).toFixed(1) + ' MB / 注入提醒 ' + ((parts.injected || 0) / 1e6).toFixed(1) + ' MB',
+    ].join('\n'),
   )
+  if (namedSkills.length > 0) push('用过的 skill（来自工具调用）', namedSkills.map(([k, n]) => '- ' + k + ' × ' + n).join('\n'))
+  if (named.length > 0) push('工具调用统计', named.map(([k, n]) => '- ' + k + ' × ' + n).join('\n'))
+  push('用户说过的话（时间序，未改写）', users.map((t, i) => i + 1 + '. ' + clip(t, 800)).join('\n'))
+  push('助手说过的话（尾部结论，未改写）', notes.map((t, i) => '- ' + clip(t, 500)).join('\n'))
+  if (paths.length > 0) push('出现过的绝对路径（最近 ' + paths.length + ' 条）', paths.map((p) => '- ' + p).join('\n'))
+  return chunks.join('')
+}
+
+const HANDOFF_SYSTEM = [
+  '你在写一份交接文档，读者是下一次会话的 agent：它看不到当前对话，只能读到这份文件。',
+  '只使用给定材料，不编造；材料里没有的信息写「未记录」。不要写「可能」「也许」这类猜测。',
+  '输出中文 Markdown，只写下面这些二级标题，顺序不变，不要加前言、结语或自评：',
+  '## 目标',
+  '## 当前状态',
+  '## 已完成',
+  '## 未完成',
+  '## 下一步',
+  '## 用到的 skill 与关键决定',
+  '## 约束与坑',
+  '每节的写法：目标是一件能说清的事和它的理由；当前状态写做到哪一步以及证据（文件、命令、数字）；',
+  '已完成逐条带产物路径或可复现命令；未完成逐条写清卡在哪；下一步只写接手者的第一个具体动作；',
+  'skill 只列真的被调用过的，并说明关键取舍为什么这么定；约束与坑分开写「用户要求」「已踩的坑」「不能碰」。',
+  '同一件事只写结论和证据，不复述来回调试的过程。全文控制在 1200 字以内。',
+].join('\n')
+
+async function modelSummary(ctx, session, pack, cfg) {
+  if (cfg.handoffAi === false) return { text: null, error: null, route: null, truncated: false }
+  let llm
+  try {
+    llm = typeof ctx.get === 'function' ? ctx.get('llm') : null
+  } catch {
+    llm = null
+  }
+  if (!llm || typeof llm.stream !== 'function') return { text: null, error: '没有 llm 服务', route: null, truncated: false }
+  let header = null
+  try {
+    header = typeof session.requestHeader === 'function' ? session.requestHeader() : null
+  } catch {
+    header = null
+  }
+  const config = header && header.config ? header.config : null
+  const provider = config && config.provider
+  const model = config && config.model
+  if (!provider || !model) return { text: null, error: '会话还没有模型路由', route: null, truncated: false }
+  const controller = new AbortController()
+  const timeoutMs = cfg.handoffTimeoutMs || DEFAULTS.handoffTimeoutMs
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  let text = ''
+  let error = null
+  let finish = ''
+  try {
+    const stream = llm.stream({
+      provider,
+      model,
+      system: HANDOFF_SYSTEM,
+      messages: [{ role: 'user', content: [{ type: 'text', text: pack }] }],
+      maxTokens: 12000,
+      temperature: 0.2,
+      signal: controller.signal,
+      sessionId: session.id,
+      purpose: 'context-guard-handoff',
+    })
+    for await (const chunk of stream) {
+      if (!chunk) continue
+      if (chunk.type === 'text-delta' && chunk.text) text += chunk.text
+      if (chunk.type === 'finish' && chunk.reason && chunk.reason.kind) finish = chunk.reason.kind
+    }
+  } catch (failure) {
+    error = failure && failure.message ? failure.message : String(failure)
+  } finally {
+    clearTimeout(timer)
+  }
+  const trimmed = text.trim()
+  if (!trimmed) return { text: null, error: error || '模型没有返回内容', route: provider + '/' + model, truncated: false }
+  return { text: trimmed, error, route: provider + '/' + model, truncated: finish === 'max-tokens' }
+}
+
+function localSections(session, snapshot, cwd, messages) {
+  const users = userInstructions(messages)
+  const notes = assistantNotes(messages, 12)
+  const lines = []
+  lines.push('> 本次没有走模型整理（' + '模型不可用或被关闭' + '），下面是本机可核对的事实，未做归纳。')
   lines.push('')
   lines.push('## 目标')
   lines.push('')
-  if (goalSource) {
-    const text = clip(messageText(goalSource), 1200)
-    lines.push('> ' + (text || '（最后一条用户消息没有正文）'))
+  if (users.length === 0) {
+    lines.push('（这个会话里没有留下用户消息，接手的第一个动作是问清要做什么）')
   } else {
-    lines.push('（没有找到用户消息，接手的第一个动作是问清要做什么）')
+    lines.push('最初的诉求：' + clip(users[0], 600))
+    lines.push('')
+    lines.push('用户后来提出过（时间序）：')
+    lines.push('')
+    for (const item of users.slice(-40)) lines.push('- ' + clip(item, 400))
   }
   lines.push('')
-  lines.push('## 最近对话（原始摘录，未做归纳）')
+  lines.push('## 当前状态')
   lines.push('')
-  if (recent.length === 0) lines.push('（空）')
-  for (const item of recent) {
-    lines.push('- ' + (item.role === 'user' ? '**用户**' : '助手') + ' `' + clockText(item.time) + '`：' + item.text)
-  }
-  lines.push('')
-  lines.push('## 关键路径（从工具调用参数里提取，最近 ' + paths.length + ' 条）')
-  lines.push('')
-  if (paths.length === 0) lines.push('（本次会话没有在工具调用里出现绝对路径）')
-  for (const item of paths) lines.push('- `' + item + '`')
+  lines.push('- 会话共 ' + snapshot.turns + ' 轮 / ' + snapshot.messages + ' 条消息，占用 ' + (snapshot.bytes / 1e6).toFixed(1) + ' / ' + (snapshot.limit / 1e6).toFixed(1) + ' MB（' + snapshot.percent + '%）')
+  lines.push('- 工作目录：`' + cwd + '`')
+  lines.push('- 未整理，接手前请先读完整记录或问用户确认进度')
   lines.push('')
   lines.push('## 已完成')
   lines.push('')
-  lines.push('- （按上面的对话记录核对后填写）')
+  lines.push('- （未整理：按下面的助手结论与产物路径核对）')
   lines.push('')
   lines.push('## 未完成')
   lines.push('')
-  lines.push('- （按上面的对话记录核对后填写）')
+  lines.push('- （未整理）')
   lines.push('')
   lines.push('## 下一步')
   lines.push('')
-  lines.push('- （写清接着做什么；这一节是接手会话的行动依据）')
+  lines.push('- （未整理）')
+  lines.push('')
+  lines.push('## 用到的 skill 与关键决定')
+  lines.push('')
+  const usage = toolUsage(messages)
+  if (usage.namedSkills.length > 0) {
+    for (const [name, count] of usage.namedSkills) lines.push('- skill ' + name + ' × ' + count)
+  } else {
+    lines.push('- （没有从工具调用里识别到 skill）')
+  }
+  lines.push('')
+  lines.push('## 约束与坑')
+  lines.push('')
+  lines.push('- （未整理）')
+  lines.push('')
+  lines.push('## 附录：助手最近的结论')
+  lines.push('')
+  for (const note of notes) lines.push('- ' + clip(note, 400))
   lines.push('')
   return lines.join('\n')
+}
+
+function handoffHeader(session, snapshot, cwd, now, mode, route, aiError) {
+  const parts = snapshot.parts || {}
+  const lines = []
+  lines.push('- 生成：' + now.getFullYear() + '-' + pad2(now.getMonth() + 1) + '-' + pad2(now.getDate()) + ' ' + pad2(now.getHours()) + ':' + pad2(now.getMinutes()))
+  lines.push('- 来源会话：`' + session.id + '`（' + snapshot.turns + ' 轮 / ' + snapshot.messages + ' 条消息）')
+  lines.push('- 工作目录：`' + cwd + '`')
+  lines.push('- 上下文体积：' + (snapshot.bytes / 1e6).toFixed(1) + ' / ' + (snapshot.limit / 1e6).toFixed(1) + ' MB（' + snapshot.percent + '%）')
+  lines.push('- 体积构成：工具结果 ' + ((parts.tool || 0) / 1e6).toFixed(1) + ' MB / 助手文本 ' + ((parts.assistant || 0) / 1e6).toFixed(1) + ' MB / 用户消息 ' + ((parts.user || 0) / 1e6).toFixed(1) + ' MB / 注入提醒 ' + ((parts.injected || 0) / 1e6).toFixed(1) + ' MB')
+  if (mode === 'ai') lines.push('- 整理方式：模型整理（' + route + '），依据本会话的真实消息、工具调用与产物路径')
+  else lines.push('- 整理方式：本机摘录（' + (aiError || '模型整理被关闭') + '）')
+  return lines.join('\n')
+}
+
+async function buildHandoffDoc(ctx, session, snapshot, cfg) {
+  const messages = session.deriveMessages()
+  const cwd = resolveCwd(ctx, session)
+  const now = new Date()
+  const base = handoffBaseName(cwd, now)
+  const pack = buildFactPack(session, snapshot, cwd, messages, cfg)
+  let summary = { text: null, error: null, route: null }
+  try {
+    summary = await modelSummary(ctx, session, pack, cfg)
+  } catch (error) {
+    summary = { text: null, error: error && error.message ? error.message : String(error), route: null }
+  }
+  const mode = summary.text ? 'ai' : 'local'
+  const lines = []
+  lines.push('# ' + base)
+  lines.push('')
+  lines.push(handoffHeader(session, snapshot, cwd, now, mode, summary.route, summary.error))
+  lines.push('')
+  if (summary.text) {
+    lines.push(summary.text)
+    lines.push('')
+    if (summary.truncated) {
+      lines.push('> 注意：这份整理在模型输出上限处被截断，"未完成/下一步"可能不完整，补问一句再动手。')
+      lines.push('')
+    }
+    const paths = collectPaths(messages, 20)
+    const usage = toolUsage(messages)
+    lines.push('---')
+    lines.push('')
+    lines.push('## 附：本机核对数据')
+    lines.push('')
+    if (usage.namedSkills.length > 0) {
+      lines.push('**实际调用过的 skill**：' + usage.namedSkills.map(([k, n]) => k + ' × ' + n).join('、'))
+      lines.push('')
+    }
+    if (paths.length > 0) {
+      lines.push('**出现过的路径（最近 ' + paths.length + ' 条）**')
+      lines.push('')
+      for (const item of paths) lines.push('- `' + item + '`')
+      lines.push('')
+    }
+    const users = userInstructions(messages)
+    if (users.length > 0) {
+      lines.push('**用户原话（最后 10 条，未改写）**')
+      lines.push('')
+      for (const item of users.slice(-10)) lines.push('- ' + clip(item, 400))
+    }
+  } else {
+    lines.push(localSections(session, snapshot, cwd, messages))
+  }
+  lines.push('')
+  return { text: lines.join('\n'), base }
 }
 
 function resolveCwd(ctx, session) {
@@ -611,6 +861,7 @@ async function handleApi(ctx, req, res) {
       showBadge: cfg.showBadge,
       showAlerts: cfg.showAlerts,
       handoffDir: cfg.handoffDir,
+      handoffAi: cfg.handoffAi !== false,
       cwd: resolveCwd(ctx, session),
       ...snapshot,
     })
@@ -633,19 +884,25 @@ async function handleApi(ctx, req, res) {
     const snapshot = measureSession(session, cfg, true, resolveContextWindow(ctx, session, cfg))
     const cwd = resolveCwd(ctx, session)
     const dir = path.join(cwd, cfg.handoffDir || DEFAULTS.handoffDir)
-    const file = path.join(dir, '交接_' + stamp(new Date()) + '.md')
+    const now = new Date()
+    let build
+    try {
+      build = await buildHandoffDoc(ctx, session, snapshot, cfg)
+    } catch (error) {
+      return sendJson(res, 500, { ok: false, error: '生成交接文档失败：' + error.message })
+    }
+    let file = ''
     try {
       mkdirSync(dir, { recursive: true })
-      const text = buildHandoffDoc(ctx, session, snapshot, cfg)
-      await fsp.writeFile(file, text, 'utf8')
+      file = handoffFilePath(dir, build.base)
+      await fsp.writeFile(file, build.text, 'utf8')
     } catch (error) {
       return sendJson(res, 500, { ok: false, error: '写交接文档失败：' + error.message })
     }
     const prompt =
-      '接着上一个会话继续。先读交接文档：' +
-      file +
+      '「' + build.base + '」接着上一个会话继续。先读交接文档：' + file +
       '\n读完后用一句话复述「要做什么、从哪继续」，等我确认再动手。'
-    return sendJson(res, 200, { ok: true, path: file, prompt, bytes: snapshot.bytes, percent: snapshot.percent })
+    return sendJson(res, 200, { ok: true, path: file, prompt, name: build.base, bytes: snapshot.bytes, percent: snapshot.percent })
   }
 
   return sendJson(res, 404, { ok: false, error: '未知接口 ' + route })

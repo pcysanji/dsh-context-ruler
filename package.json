@@ -1,6 +1,6 @@
 {
   "name": "dsh-context-ruler",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Context guard for DeepSeek Harness: live payload size on the answer action row, warn/danger colors, one-click handoff (draft only).",
   "keywords": [
     "dsh-plugin",

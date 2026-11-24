@@ -66,6 +66,7 @@ window.__ModuleLoader__.load({
           fieldDanger: '危险线（%）',
           fieldRefresh: '刷新间隔（轮）',
           fieldAuto: '自动（按当前模型的上下文上限）',
+          fieldHandoffAi: '交接文档由模型整理（更完整，点交接时花一次 token）',
         fieldWindow: '上下文窗口（token）',
           fieldBpt: '每个 token 字节数',
           noData: '还没有数字',
@@ -107,6 +108,7 @@ window.__ModuleLoader__.load({
           fieldDanger: 'Danger line (%)',
           fieldRefresh: 'Refresh every (turns)',
           fieldAuto: 'Auto (use the model limit)',
+          fieldHandoffAi: 'Let the model write the handoff document (more complete, one model call per handoff)',
         fieldWindow: 'Context window (tokens)',
           fieldBpt: 'Bytes per token',
           noData: 'No numbers yet',
@@ -396,7 +398,7 @@ window.__ModuleLoader__.load({
           ? h(
               'div',
               { className: 'cg-actions' },
-              h('button', { className: 'cg-btn primary', onClick: props.onHandoff, disabled: props.busy }, COPY.handoff),
+              h('button', { className: 'cg-btn primary', onClick: props.onHandoff, disabled: props.busy }, props.busy ? COPY.busy : COPY.handoff),
               h('button', { className: 'cg-btn', onClick: props.onRefresh, disabled: props.busy }, COPY.refresh)
             )
           : null
@@ -414,6 +416,7 @@ window.__ModuleLoader__.load({
         danger: Math.round((data.dangerRatio || 0.85) * 100),
         refreshEveryTurns: data.refreshEveryTurns || 25,
         autoLimit: data.autoLimit !== false,
+        handoffAi: data.handoffAi !== false,
         contextWindow: data.contextWindow || 750000,
         bytesPerToken: data.bytesPerToken || 7.5,
       }))
@@ -432,6 +435,7 @@ window.__ModuleLoader__.load({
             dangerRatio: Math.min(1, Math.max(0.02, form.danger / 100)),
             refreshEveryTurns: Math.max(1, Math.round(form.refreshEveryTurns) || 25),
             autoLimit: !!form.autoLimit,
+            handoffAi: !!form.handoffAi,
             contextWindow: Math.max(1000, Math.round(form.contextWindow) || 750000),
             bytesPerToken: Math.max(0.5, Number(form.bytesPerToken) || 7.5),
           })
@@ -473,6 +477,16 @@ window.__ModuleLoader__.load({
             }),
             COPY.fieldAuto
           ),
+          h(
+            'label',
+            { className: 'cg-check cg-check-wide' },
+            h('input', {
+              type: 'checkbox',
+              checked: !!form.handoffAi,
+              onChange: (event) => setForm((c) => ({ ...c, handoffAi: event.target.checked })),
+            }),
+            COPY.fieldHandoffAi
+          ),
           h('label', null, COPY.fieldWindow),
           h('input', {
             type: 'number',
@@ -513,7 +527,7 @@ window.__ModuleLoader__.load({
         h(
           'div',
           { className: 'cg-alert-actions' },
-          h('button', { className: 'cg-btn primary', onClick: props.onHandoff, disabled: props.busy }, COPY.now),
+          h('button', { className: 'cg-btn primary', onClick: props.onHandoff, disabled: props.busy }, props.busy ? COPY.busy : COPY.now),
           h('button', { className: 'cg-btn', onClick: props.onLater }, COPY.later)
         )
       )
@@ -601,6 +615,7 @@ window.__ModuleLoader__.load({
       const doHandoff = React.useCallback(async () => {
         if (busy) return
         setBusy(true)
+        showToast(COPY.busy)
         try {
           const result = await postJson('handoff', { sessionId })
           const uiWorkspace = pluginCtx && pluginCtx.get ? pluginCtx.get('uiWorkspace') : null
