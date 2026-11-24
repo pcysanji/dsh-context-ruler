@@ -8,7 +8,7 @@
  */
 
 window.__ModuleLoader__.load({
-  id: 'dsh-context-guard',
+  id: 'dsh-context-ruler',
   factory(require) {
     'use strict'
 
