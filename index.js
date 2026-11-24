@@ -454,9 +454,23 @@ function projectName(cwd) {
   return base.replace(/[\\/:*?"<>|]/g, '_').slice(0, 60)
 }
 
-function handoffBaseName(cwd, now) {
+function cleanProjectName(raw) {
+  if (!raw) return ''
+  let text = String(raw).trim()
+  text = text.replace(/^[#\s>*\-]+/, '')
+  text = text.replace(/^(项目名|项目名称|Project)[:：]\s*/i, '')
+  text = text.replace(/[\\/:*?"<>|\r\n\t]/g, ' ')
+  text = text.replace(/\s+/g, ' ').trim()
+  text = text.replace(/[。．.、,，;；:：]+$/, '').trim()
+  if (text.length > 24) text = text.slice(0, 24).trim()
+  if (/交接$/.test(text)) text = text.replace(/交接$/, '').trim()
+  return text
+}
+
+function handoffBaseName(cwd, now, project) {
   const day = String(now.getFullYear()) + pad2(now.getMonth() + 1) + pad2(now.getDate())
-  return projectName(cwd) + '_' + day + '交接'
+  const name = cleanProjectName(project) || projectName(cwd)
+  return name + '_' + day + '交接'
 }
 
 /* 同一项目同一天只有一份交接文档：重跑就覆盖，避免下一个人面对一堆同名的旧稿。 */
@@ -570,6 +584,26 @@ function linksSeen(messages, limit) {
   return limit && all.length > limit ? all.slice(all.length - limit) : all
 }
 
+/* 宿主能直接读到的事实：版本号、最近一次提交。模型最容易在这两处编造。 */
+function localFacts() {
+  const out = []
+  try {
+    const pkg = JSON.parse(readFileSync(path.join(HERE, 'package.json'), 'utf8'))
+    if (pkg && pkg.version) out.push('插件版本 package.json：' + pkg.version)
+  } catch {
+    /* 读不到就不写 */
+  }
+  try {
+    const log = readFileSync(path.join(HERE, '.git', 'logs', 'HEAD'), 'utf8').trim().split('\n')
+    const last = log[log.length - 1] || ''
+    const tail = last.split('\t').pop() || ''
+    if (tail) out.push('最近一次提交：' + tail.trim())
+  } catch {
+    /* 没有 git 就跳过 */
+  }
+  return out
+}
+
 /* 交给模型的事实包：先保证「人说过什么」，再补助手结论、工具与路径，超预算就截尾。 */
 function buildFactPack(session, snapshot, cwd, messages, cfg) {
   const { named, namedSkills } = toolUsage(messages)
@@ -596,6 +630,8 @@ function buildFactPack(session, snapshot, cwd, messages, cfg) {
       '- 体积构成：工具结果 ' + ((parts.tool || 0) / 1e6).toFixed(1) + ' MB / 助手文本 ' + ((parts.assistant || 0) / 1e6).toFixed(1) + ' MB / 用户消息 ' + ((parts.user || 0) / 1e6).toFixed(1) + ' MB / 注入提醒 ' + ((parts.injected || 0) / 1e6).toFixed(1) + ' MB',
     ].join('\n'),
   )
+  const facts = localFacts()
+  if (facts.length > 0) push('本机事实（宿主直接读取，不是模型回忆）', facts.map((x) => '- ' + x).join('\n'))
   if (namedSkills.length > 0) push('用过的 skill（来自工具调用）', namedSkills.map(([k, n]) => '- ' + k + ' × ' + n).join('\n'))
   if (named.length > 0) push('工具调用统计', named.map(([k, n]) => '- ' + k + ' × ' + n).join('\n'))
   push('用户说过的话（时间序，未改写）', users.map((t, i) => i + 1 + '. ' + clip(t, 800)).join('\n'))
@@ -611,7 +647,8 @@ function buildFactPack(session, snapshot, cwd, messages, cfg) {
 const HANDOFF_SYSTEM = [
   '你在写一份交接文档，读者是下一次会话的 agent：它看不到当前对话，只能读到这份文件。',
   '只使用给定材料，不编造；材料里没有的信息写「未记录」。不要写「可能」「也许」这类猜测。',
-  '输出中文 Markdown，只写下面这些二级标题，顺序不变，不要加前言、结语或自评：',
+  '输出的第一行必须是『项目名：<8~20 字的短语>』，用这个会话真正在做的这件事来命名（例如「上下文看门插件开发」「剪映批量导出修复」），不要用文件夹名、不要用「默认工作区」这类占位词；之后空一行。',
+  '然后是下面这些二级标题，顺序不变，不要加前言、结语或自评：',
   '## 目标',
   '## 当前状态',
   '## 已完成',
@@ -760,7 +797,6 @@ async function buildHandoffDoc(ctx, session, snapshot, cfg) {
   const messages = session.deriveMessages()
   const cwd = resolveCwd(ctx, session)
   const now = new Date()
-  const base = handoffBaseName(cwd, now)
   const pack = buildFactPack(session, snapshot, cwd, messages, cfg)
   let summary = { text: null, error: null, route: null }
   try {
@@ -769,6 +805,14 @@ async function buildHandoffDoc(ctx, session, snapshot, cfg) {
     summary = { text: null, error: error && error.message ? error.message : String(error), route: null }
   }
   const mode = summary.text ? 'ai' : 'local'
+  let project = ''
+  if (summary.text) {
+    const head = summary.text.split('\n').slice(0, 3).join('\n')
+    const found = head.match(/^\s*(?:#\s*)?(?:项目名|项目名称)[:：]\s*(.+)$/m)
+    if (found) project = cleanProjectName(found[1])
+    summary.text = summary.text.replace(/^\s*(?:#\s*)?(?:项目名|项目名称)[:：].*\n?/m, '').trim()
+  }
+  const base = handoffBaseName(cwd, now, project)
   const lines = []
   lines.push('# ' + base)
   lines.push('')
